@@ -13,6 +13,8 @@ from garminconnect import Garmin
 
 # --- CLOUD RUN HACK ---
 os.environ['HOME'] = '/tmp'
+TOKEN_DIR = '/tmp/garmin_tokens'
+PENDING_MFA_FILE = '/tmp/pending_mfa.json'
 
 # --- ENVIRONMENT VARIABLES / VARIABLES DE ENTORNO ---
 GARMIN_EMAIL = os.environ.get('GARMIN_EMAIL')
@@ -43,7 +45,11 @@ TRANS = {
         'err_empty': "❌ Error: Actividad vacía.",
         'err_menu': "❌ Error obteniendo menú",
         'err_morning': "❌ Error obteniendo reporte matutino",
-        'help_msg': "🤖 **Comandos:**\n☀️ `mañana` (Salud)\n📋 `lista` (Historial)\n🔢 `0` (Último entreno)",
+        'mfa_prompt': "🔐 **Garmin requiere MFA**\n\nPor favor envía el código de 6 dígitos con el comando:\n`/mfa 123456`",
+        'mfa_success': "✅ **MFA verificado correctamente.** Sesión guardada. Ya puedes usar tus comandos.",
+        'mfa_no_pending': "⚠️ No hay ninguna solicitud MFA pendiente.",
+        'mfa_invalid_format': "⚠️ Formato incorrecto. Uso: `/mfa 123456`",
+        'help_msg': "🤖 **Comandos:**\n☀️ `mañana` (Salud)\n📋 `lista` (Historial)\n🔢 `0` (Último entreno)\n🔐 `/mfa 123456` (Para ingresar código Garmin)",
         'menu_title': "📋 **Últimas Actividades:**",
         'menu_footer': "👉 *Envía el número (0, 1...) para ver detalles.*",
         'morning_title': "🌅 **Reporte Matutino**",
@@ -58,7 +64,7 @@ TRANS = {
         'readiness': "🚦 **Disposición**",
         'advice_go': "🚀 ¡A VOLAR! Estás a tope.",
         'advice_ok': "✅ Luz verde para entrenar.",
-        'advice_warn': "⚠️ Baja la carga hoy.",
+        'advice_warn': "⚠️️ Baja la carga hoy.",
         'advice_stop': "🛑 Descansa, soldado.",
         'rep_title': "🏃 **REPORTE**",
         'sec_main': "⏱️ **PRINCIPALES**",
@@ -91,7 +97,11 @@ TRANS = {
         'err_empty': "❌ Error: Empty activity.",
         'err_menu': "❌ Error fetching menu",
         'err_morning': "❌ Error fetching morning report",
-        'help_msg': "🤖 **Bot Commands:**\n☀️ `morning` (Health)\n📋 `list` (History)\n🔢 `0` (Latest activity)",
+        'mfa_prompt': "🔐 **Garmin MFA Required**\n\nPlease reply with your 6-digit code using:\n`/mfa 123456`",
+        'mfa_success': "✅ **MFA successfully verified.** Session saved. You can now use all commands.",
+        'mfa_no_pending': "⚠️ No pending MFA request found.",
+        'mfa_invalid_format': "⚠️ Incorrect format. Use: `/mfa 123456`",
+        'help_msg': "🤖 **Bot Commands:**\n☀️ `morning` (Health)\n📋 `list` (History)\n🔢 `0` (Latest activity)\n🔐 `/mfa 123456` (Enter Garmin MFA code)",
         'menu_title': "📋 **Recent Activities:**",
         'menu_footer': "👉 *Send the number (0, 1...) for details.*",
         'morning_title': "🌅 **Morning Report**",
@@ -135,13 +145,58 @@ TRANS = {
 T = TRANS.get(LANG_CODE, TRANS['es'])
 
 # ==============================================================================
+# GARMIN AUTH & MFA UTILITIES
+# ==============================================================================
+
+def get_garmin_client(chat_id=None, mfa_code=None):
+    """
+    Initializes Garmin client using stored tokens if available.
+    If full auth is required and MFA triggers, prompts user or uses provided mfa_code.
+    """
+    garmin = Garmin()
+
+    # 1. Try restoring existing session tokens
+    if os.path.exists(TOKEN_DIR):
+        try:
+            garmin.login(TOKEN_DIR)
+            return garmin
+        except Exception as e:
+            logging.warning(f"Failed to restore saved token session: {e}")
+
+    # 2. If token login fails/doesn't exist, log in with credentials
+    garmin = Garmin(
+        email=GARMIN_EMAIL,
+        password=GARMIN_PASSWORD,
+        prompt_mfa=lambda: mfa_code if mfa_code else _trigger_mfa_flow(chat_id)
+    )
+    garmin.login()
+
+    # 3. Save successful login session tokens for future webhooks
+    os.makedirs(TOKEN_DIR, exist_ok=True)
+    garmin.garth.dump(TOKEN_DIR)
+    
+    # Clear pending state if exists
+    if os.path.exists(PENDING_MFA_FILE):
+        try: os.remove(PENDING_MFA_FILE)
+        except: pass
+
+    return garmin
+
+def _trigger_mfa_flow(chat_id):
+    """Called by Garmin library when MFA is required during initial auth."""
+    if chat_id:
+        # Mark pending MFA state so user can reply with /mfa
+        with open(PENDING_MFA_FILE, 'w') as f:
+            json.dump({'chat_id': chat_id, 'timestamp': datetime.now().timestamp()}, f)
+        send_telegram(chat_id, T['mfa_prompt'])
+    
+    raise Exception("MFA Required. Prompt sent to Telegram. Please reply with /mfa <code>.")
+
+# ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
 
 def get_dynamic_today(garmin_client):
-    """
-    TRAVELER MODE / MODO VIAJERO ✈️
-    """
     try:
         settings = garmin_client.get_user_settings()
         user_tz_name = settings.get('userData', {}).get('timeZone')
@@ -217,10 +272,9 @@ def send_telegram(chat_id, text, use_markdown=True):
 # MORNING REPORT LOGIC / LÓGICA DE REPORTE MATUTINO
 # ==============================================================================
 
-def get_morning_report():
+def get_morning_report(chat_id=None):
     try:
-        garmin = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-        garmin.login()
+        garmin = get_garmin_client(chat_id=chat_id)
         today = get_dynamic_today(garmin)
         
         # 1. SLEEP
@@ -294,272 +348,4 @@ def get_morning_report():
             if hrv_data and 'hrvSummary' in hrv_data:
                 summary = hrv_data['hrvSummary']
                 hrv_status = summary.get('status', '-').title()
-                hrv_avg = summary.get('weeklyAvg', '-')
-                hrv_last = summary.get('lastNightAvg', '-') # Extract last night / Extraer última noche
-        except: pass
-
-        msg = f"{T['morning_title']}: {today}\n\n"
-        msg += f"{T['sleep']}: {sleep_score}/100 ({sleep_qual})\n"
-        msg += f"   {T['duration']}: {format_duration_hm(sleep_secs)} {sleep_range}\n\n"
-        msg += f"{T['body_batt']}: {T['bb_max']}: {bb_charged} | {T['bb_now']}: {bb_now}\n"
-        
-        # HRV DISPLAY CHANGE: Shows Last Night and Average
-        msg += f"{T['heart']}:\n   {T['rhr']}: {rhr} ppm\n   {T['hrv']}: {hrv_status} (Last: {hrv_last} | Avg: {hrv_avg} ms)\n\n"
-        
-        msg += f"{T['readiness']}: {readiness}/100\n"
-        
-        try:
-            if readiness != "-":
-                r_val = int(readiness)
-                if r_val >= 85: msg += f"   {T['advice_go']}"
-                elif r_val >= 65: msg += f"   {T['advice_ok']}"
-                elif r_val >= 45: msg += f"   {T['advice_warn']}"
-                else: msg += f"   {T['advice_stop']}"
-        except: pass
-
-        return msg
-    except Exception as e: return f"{T['err_morning']}: {str(e)}"
-
-
-# ==============================================================================
-# ACTIVITY LOGIC / LÓGICA DE ACTIVIDADES
-# ==============================================================================
-
-def get_activity_menu():
-    try:
-        garmin = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-        garmin.login()
-        activities = garmin.get_activities(0, 5)
-        if not activities: return T['err_not_found']
-        
-        msg = f"{T['menu_title']}\n\n"
-        for i, act in enumerate(activities):
-            start = act.get("startTimeLocal", "")[:16].replace("T", " ")
-            name = act.get("activityName", "Sin nombre")
-            type_key = act.get("activityType", {}).get("typeKey", "activity")
-            dist_km = act.get("distance", 0) / 1000
-            msg += f"`{i}` - *{start}*\n   🏃 {type_key} | 📏 {dist_km:.2f} km\n   📝 {name}\n\n"
-        
-        msg += f"\n{T['menu_footer']}"
-        return msg
-    except Exception as e: return f"{T['err_menu']}: {str(e)}"
-
-def process_report(data, zones_raw, splits_raw):
-    s = data.get('summaryDTO', {})
-    total_duration = s.get("duration", 0)
-    
-    location = data.get("locationName", "-")
-    min_elev = safe_round(s.get("minElevation"), 0)
-    max_elev = safe_round(s.get("maxElevation"), 0)
-    loc_str = f"{location} ({max_elev} m)" if min_elev != "-" else location
-
-    metrics = {
-        "fecha": s.get("startTimeLocal", "").replace("T", " "),
-        "lugar_completo": loc_str,
-        "tipo": data.get("activityTypeDTO", {}).get("typeKey"),
-        "distancia": safe_round(s.get("distance", 0), 2),
-        "duracion": s.get("duration", 0),
-        "ritmo_ms": s.get("averageSpeed"),
-        "vel_kmh": safe_round(s.get("averageSpeed", 0) * 3.6, 2),
-        "fc_avg": safe_round(s.get("averageHR", "N/A"), 0),
-        "fc_max": safe_round(s.get("maxHR", "N/A"), 0),
-        "te_aer": safe_round(s.get("trainingEffect", "N/A"), 1),
-        "te_ana": safe_round(s.get("anaerobicTrainingEffect", 0.0), 1),
-        "carga": safe_round(s.get("activityTrainingLoad", "N/A"), 0),
-        "calorias": safe_round(s.get("calories", "N/A"), 0),
-        "cadencia": safe_round(s.get("averageRunCadence", "N/A"), 0),
-        "cadencia_max": safe_round(s.get("maxRunCadence", "N/A"), 0),
-        "zancada": safe_round(s.get("strideLength", "N/A"), 0),
-        "ratio_v": safe_round(s.get("verticalRatio", "N/A"), 1),
-        "osc_v": safe_round(s.get("verticalOscillation", "N/A"), 1),
-        "gct": safe_round(s.get("groundContactTime", "N/A"), 0),
-        "potencia": safe_round(s.get("averagePower", "N/A"), 0),
-        "ascenso": safe_round(s.get("elevationGain", 0), 0),
-        "gap_ms": s.get("avgGradeAdjustedSpeed")
-    }
-    
-    rpe_raw = s.get("directWorkoutRpe")
-    metrics['rpe'] = safe_round(rpe_raw / 10, 0) if rpe_raw else "__"
-    feel_raw = s.get("directWorkoutFeel")
-    feel_map = T['feel_map']
-    if feel_raw is not None:
-        metrics['feeling'] = feel_map[min(feel_map.keys(), key=lambda k: abs(k-feel_raw))]
-    else:
-        metrics['feeling'] = "-"
-    
-    ciq_ef = get_ciq_by_id(data, EF_APP_ID, EF_FIELD_NUM_GLOBAL)
-    metrics['ef'] = f"{ciq_ef:.2f}" if ciq_ef else "-"
-    
-    zones_list = []
-    if zones_raw:
-        zones_sorted = sorted(zones_raw, key=lambda x: x['zoneNumber'])
-        for i, z in enumerate(zones_sorted):
-            z_num = z.get('zoneNumber')
-            secs = z.get('secsInZone', 0)
-            low_bound = int(z.get('zoneLowBoundary', 0))
-            if i < len(zones_sorted) - 1:
-                next_low = int(zones_sorted[i+1].get('zoneLowBoundary', 0))
-                range_str = f"{low_bound}-{next_low - 1} ppm"
-            else: range_str = f">{low_bound} ppm"
-            if secs > 0:
-                pct = (secs / metrics['duracion']) * 100 if metrics['duracion'] > 0 else 0
-                zones_list.append(f"  * Z{z_num} ({range_str}): {pct:.0f}% ({format_time(secs)})")
-    metrics['zonas_txt'] = "\n".join(zones_list) if zones_list else "---"
-    
-    clean_laps = []
-    source_list = []
-    if splits_raw and 'lapDTOs' in splits_raw and len(splits_raw['lapDTOs']) > 0:
-        source_list = splits_raw['lapDTOs']
-    elif 'laps' in data and len(data['laps']) > 0:
-        source_list = data['laps']
-    else: source_list = data.get('splitSummaries', [])
-    
-    for i, split in enumerate(source_list):
-        dist = split.get("distance", 0)
-        dur = split.get("duration", 0)
-        if dist < 10 and dur < 10: continue
-        if "splitSummaries" in str(source_list) and len(source_list) > 1:
-            if abs(dur - total_duration) < 2.0: continue
-        
-        clean_laps.append({
-            "nr": len(clean_laps) + 1,
-            "dist": dist,
-            "ritmo": format_pace(split.get("averageSpeed")),
-            "gap": format_pace(split.get("avgGradeAdjustedSpeed")),
-            "fc": safe_round(split.get("averageHR", "-"), 0),
-            "cad": safe_round(split.get("averageRunCadence", "N/A"), 0),
-            "gct": safe_round(split.get("groundContactTime", "N/A"), 0),
-            "ef": f"{get_ciq_by_id(split, EF_APP_ID, EF_FIELD_NUM_LAP):.2f}" if get_ciq_by_id(split, EF_APP_ID, EF_FIELD_NUM_LAP) else "-"
-        })
-    metrics['laps'] = clean_laps
-    return metrics
-
-def generate_markdown(m):
-    laps_table = "```\n"
-    laps_table += f"| #  | km   | {T['lbl_pace']} | {T['lbl_gap']}   | FC  | {T['lbl_cad']} | {T['lbl_gct']} | EF  |\n"
-    laps_table += "|----|------|-------|-------|-----|-----|-----|-----|\n"
-    
-    for l in m['laps']:
-        nr = str(l['nr']).rjust(2)
-        dist = f"{(l['dist']/1000):.2f}".rjust(4)
-        ritmo = str(l['ritmo']).center(5)
-        gap = str(l['gap']).center(5)
-        fc = str(l['fc']).rjust(3)
-        cad = str(l['cad']).rjust(3)
-        gct = str(l['gct']).rjust(3)
-        ef = str(l['ef']).rjust(4)
-        laps_table += f"| {nr} | {dist} | {ritmo} | {gap} | {fc} | {cad} | {gct} | {ef} |\n"
-    
-    laps_table += "```"
-    
-    return f"""
-# {T['rep_title']}: *{m['tipo'].upper()}*
-📅 {m['fecha']}
-📍 {m['lugar_completo']}
-
-{T['sec_main']}
-{T['lbl_dist']}: `{m['distancia']} m` | {T['lbl_time']}: `{format_time(m['duracion'])}`
-{T['lbl_pace']}: `{format_pace(m['ritmo_ms'])}/km` | {T['lbl_gap']}: `{format_pace(m['gap_ms'])}/km`
-Vel: `{m['vel_kmh']} km/h` | {T['lbl_asc']}: `{m['ascenso']} m`
-
-{T['sec_cardio']}
-FC Avg: `{m['fc_avg']} ppm` | Max: `{m['fc_max']} ppm`
-{T['lbl_load']}: `{m['carga']}` | TE: `{m['te_aer']}` / `{m['te_ana']}`
-
-{T['sec_splits']}
-{m['zonas_txt']}
-
-{T['sec_eff']} & {T['sec_dyn']}
-EF: `{m['ef']}` | {T['lbl_pow']}: `{m['potencia']} W` | {T['lbl_cal']}: `{m['calorias']}`
-{T['lbl_cad']}: `{m['cadencia']}` | {T['lbl_stride']}: `{m['zancada']} cm`
-{T['lbl_gct']}: `{m['gct']} ms` | {T['lbl_osc']}: `{m['osc_v']} cm` (`{m['ratio_v']}%`)
-
-{laps_table}
-
-RPE: {m['rpe']}/10 | {T['lbl_sens']}: {m['feeling']}
-    """
-
-# --- ENTRY POINT ---
-def telegram_webhook(request):
-    siri_mode = request.args.get('siri') or request.args.get('source') == 'siri'
-    command_arg = request.args.get('command')
-    headers = {'Content-Type': 'text/plain; charset=utf-8'}
-
-    if siri_mode and command_arg:
-        text = command_arg.strip().lower()
-        try:
-            if text in ['mañana', 'morning', 'reporte', 'dia', 'report']:
-                return get_morning_report(), 200, headers
-            elif text in ['menu', 'lista', 'historial', 'list', 'history']:
-                return get_activity_menu(), 200, headers
-            else:
-                try:
-                    idx = int(text)
-                    garmin = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-                    garmin.login()
-                    activities = garmin.get_activities(idx, 1)
-                    if not activities: return T['err_not_found'], 200, headers
-                    act_id = activities[0]['activityId']
-                    details = garmin.get_activity(act_id)
-                    try: zones = garmin.connectapi(f"/activity-service/activity/{act_id}/hrTimeInZones")
-                    except: zones = []
-                    try: splits = garmin.connectapi(f"/activity-service/activity/{act_id}/splits")
-                    except: splits = {}
-                    if details:
-                        metrics = process_report(details, zones, splits)
-                        return generate_markdown(metrics), 200, headers
-                    return T['err_empty'], 200, headers
-                except: return "Command not found", 200, headers
-        except Exception as e: return f"Siri Error: {str(e)}", 500, headers
-
-    req = request.get_json(silent=True)
-    if not req or 'message' not in req: return 'OK', 200
-
-    chat_id = req['message']['chat']['id']
-    text = req['message'].get('text', '').strip().lower()
-
-    if text in ['mañana', 'morning', 'buenos dias', 'reporte', 'report']:
-        send_telegram(chat_id, T['loading_vital'], use_markdown=False)
-        send_telegram(chat_id, get_morning_report())
-        return 'OK', 200
-
-    if text in ['menu', 'lista', 'historial', 'list', 'history']:
-        send_telegram(chat_id, T['loading_hist'], use_markdown=False)
-        send_telegram(chat_id, get_activity_menu())
-        return 'OK', 200
-
-    try:
-        activity_index = int(text)
-        send_telegram(chat_id, T['loading_1'], use_markdown=False)
-        try:
-            garmin = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-            garmin.login()
-            send_telegram(chat_id, T['loading_2'], use_markdown=False)
-
-            activities = garmin.get_activities(activity_index, 1)
-            if not activities:
-                send_telegram(chat_id, T['err_not_found'], use_markdown=False)
-                return 'OK', 200
-            
-            act_id = activities[0]['activityId']
-            details = garmin.get_activity(act_id)
-            try: zones = garmin.connectapi(f"/activity-service/activity/{act_id}/hrTimeInZones")
-            except: zones = []
-            try: splits = garmin.connectapi(f"/activity-service/activity/{act_id}/splits")
-            except: splits = {}
-
-            if details:
-                metrics = process_report(details, zones, splits)
-                report = generate_markdown(metrics)
-                send_telegram(chat_id, report)
-            else:
-                send_telegram(chat_id, T['err_empty'], use_markdown=False)
-        except Exception as e:
-            error_trace = traceback.format_exc()
-            logging.error(f"ERROR: {error_trace}")
-            send_telegram(chat_id, f"🔥 Error: {str(e)}", use_markdown=False)
-            
-    except ValueError:
-        send_telegram(chat_id, T['help_msg'])
-
-    return 'OK', 200
+                hrv_avg = summary.get
