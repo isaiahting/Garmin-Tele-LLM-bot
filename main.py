@@ -8,23 +8,26 @@ from zoneinfo import ZoneInfo
 from garminconnect import Garmin
 
 # ==============================================================================
-# CONFIGURATION & SETUP / CONFIGURACIÓN Y SET UP
+# CONFIGURATION & SETUP
 # ==============================================================================
 
-# --- CLOUD RUN HACK ---
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+
+# --- CLOUD RUN FILE SYSTEM HACK ---
 os.environ['HOME'] = '/tmp'
 TOKEN_DIR = '/tmp/garmin_tokens'
 PENDING_MFA_FILE = '/tmp/pending_mfa.json'
 
-# --- ENVIRONMENT VARIABLES / VARIABLES DE ENTORNO ---
+# --- ENVIRONMENT VARIABLES ---
 GARMIN_EMAIL = os.environ.get('GARMIN_EMAIL')
 GARMIN_PASSWORD = os.environ.get('GARMIN_PASSWORD')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 
-# Language Selection / Selección de Idioma (Default: 'es')
+# Language Selection (Default: 'es')
 LANG_CODE = os.environ.get('BOT_LANGUAGE', 'es').lower()
 
-# Fallback Offset (Mexico City)
+# Fallback Offset (Mexico City / Singapore adjustment if fallback triggered)
 FALLBACK_OFFSET = -6
 
 # --- CONSTANTS ---
@@ -33,7 +36,7 @@ EF_FIELD_NUM_GLOBAL = 2
 EF_FIELD_NUM_LAP = 1     
 
 # ==============================================================================
-# TRANSLATION DICTIONARY / DICCIONARIO DE TRADUCCIÓN
+# TRANSLATION DICTIONARY
 # ==============================================================================
 TRANS = {
     'es': {
@@ -64,11 +67,11 @@ TRANS = {
         'readiness': "🚦 **Disposición**",
         'advice_go': "🚀 ¡A VOLAR! Estás a tope.",
         'advice_ok': "✅ Luz verde para entrenar.",
-        'advice_warn': "⚠️️ Baja la carga hoy.",
+        'advice_warn': "⚠ Baja la carga hoy.",
         'advice_stop': "🛑 Descansa, soldado.",
         'rep_title': "🏃 **REPORTE**",
         'sec_main': "⏱️ **PRINCIPALES**",
-        'sec_cardio': "❤️ **CARDIO & CARGA**",
+        'sec_cardio': "❤️️ **CARDIO & CARGA**",
         'sec_eff': "⚡ **EFICIENCIA**",
         'sec_dyn': "👟 **DINÁMICAS**",
         'sec_splits': "📊 **SPLITS**",
@@ -99,7 +102,7 @@ TRANS = {
         'err_morning': "❌ Error fetching morning report",
         'mfa_prompt': "🔐 **Garmin MFA Required**\n\nPlease reply with your 6-digit code using:\n`/mfa 123456`",
         'mfa_success': "✅ **MFA successfully verified.** Session saved. You can now use all commands.",
-        'mfa_no_pending': "⚠️ No pending MFA request found.",
+        'mfa_no_pending': "⚠️️ No pending MFA request found.",
         'mfa_invalid_format': "⚠️ Incorrect format. Use: `/mfa 123456`",
         'help_msg': "🤖 **Bot Commands:**\n☀️ `morning` (Health)\n📋 `list` (History)\n🔢 `0` (Latest activity)\n🔐 `/mfa 123456` (Enter Garmin MFA code)",
         'menu_title': "📋 **Recent Activities:**",
@@ -116,7 +119,7 @@ TRANS = {
         'readiness': "🚦 **Readiness**",
         'advice_go': "🚀 FULL SEND! You are ready.",
         'advice_ok': "✅ Good to go.",
-        'advice_warn': "⚠️ Take it easy today.",
+        'advice_warn': "⚠️️ Take it easy today.",
         'advice_stop': "🛑 Rest day recommended.",
         'rep_title': "🏃 **REPORT**",
         'sec_main': "⏱️ **MAIN STATS**",
@@ -155,7 +158,7 @@ def get_garmin_client(chat_id=None, mfa_code=None):
     """
     garmin = Garmin()
 
-    # 1. Try restoring existing session tokens
+    # 1. Try restoring existing session tokens first
     if os.path.exists(TOKEN_DIR):
         try:
             garmin.login(TOKEN_DIR)
@@ -163,7 +166,7 @@ def get_garmin_client(chat_id=None, mfa_code=None):
         except Exception as e:
             logging.warning(f"Failed to restore saved token session: {e}")
 
-    # 2. If token login fails/doesn't exist, log in with credentials
+    # 2. If token login fails or doesn't exist, log in with email/password
     garmin = Garmin(
         email=GARMIN_EMAIL,
         password=GARMIN_PASSWORD,
@@ -171,26 +174,27 @@ def get_garmin_client(chat_id=None, mfa_code=None):
     )
     garmin.login()
 
-    # 3. Save successful login session tokens for future webhooks
+    # 3. Save successful session tokens for future requests
     os.makedirs(TOKEN_DIR, exist_ok=True)
     garmin.garth.dump(TOKEN_DIR)
-    
-    # Clear pending state if exists
+
+    # Clear pending MFA state file if login succeeded
     if os.path.exists(PENDING_MFA_FILE):
-        try: os.remove(PENDING_MFA_FILE)
-        except: pass
+        try:
+            os.remove(PENDING_MFA_FILE)
+        except Exception:
+            pass
 
     return garmin
 
 def _trigger_mfa_flow(chat_id):
-    """Called by Garmin library when MFA is required during initial auth."""
+    """Called when Garmin requires an MFA code during fresh login."""
     if chat_id:
-        # Mark pending MFA state so user can reply with /mfa
         with open(PENDING_MFA_FILE, 'w') as f:
             json.dump({'chat_id': chat_id, 'timestamp': datetime.now().timestamp()}, f)
         send_telegram(chat_id, T['mfa_prompt'])
-    
-    raise Exception("MFA Required. Prompt sent to Telegram. Please reply with /mfa <code>.")
+
+    raise Exception("MFA_REQUIRED")
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -200,7 +204,6 @@ def get_dynamic_today(garmin_client):
     try:
         settings = garmin_client.get_user_settings()
         user_tz_name = settings.get('userData', {}).get('timeZone')
-        
         if user_tz_name:
             user_tz = ZoneInfo(user_tz_name)
             local_now = datetime.now(user_tz)
@@ -239,7 +242,8 @@ def safe_round(val, decimals=0):
         f = float(val)
         if decimals == 0: return int(round(f))
         return round(f, decimals)
-    except: return val
+    except Exception:
+        return val
 
 def get_ciq_by_id(data, target_app_id, target_field_num):
     ciq_list = data.get('connectIQMeasurements') or data.get('connectIQMeasurement', [])
@@ -250,13 +254,15 @@ def get_ciq_by_id(data, target_app_id, target_field_num):
         try:
             if app_id == target_app_id and int(field_num) == int(target_field_num):
                 return float(item.get('value'))
-        except: continue
+        except Exception:
+            continue
     return None
 
 def send_telegram(chat_id, text, use_markdown=True):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': chat_id, 'text': text}
-    if use_markdown: payload['parse_mode'] = 'Markdown'
+    if use_markdown:
+        payload['parse_mode'] = 'Markdown'
     try:
         response = requests.post(url, json=payload)
         response_data = response.json()
@@ -265,11 +271,11 @@ def send_telegram(chat_id, text, use_markdown=True):
             logging.error(f"⚠️ Telegram Error: {error_desc}")
             if use_markdown and ("parse" in error_desc.lower() or "markdown" in error_desc.lower()):
                 send_telegram(chat_id, text, use_markdown=False)
-    except Exception as e: logging.error(f"Connection Error: {e}")
-
+    except Exception as e:
+        logging.error(f"Connection Error: {e}")
 
 # ==============================================================================
-# MORNING REPORT LOGIC / LÓGICA DE REPORTE MATUTINO
+# MORNING REPORT LOGIC
 # ==============================================================================
 
 def get_morning_report(chat_id=None):
@@ -280,7 +286,6 @@ def get_morning_report(chat_id=None):
         # 1. SLEEP
         sleep_score, sleep_qual, sleep_secs = "-", "-", 0
         sleep_range = ""
-
         try:
             sleep_data = garmin.get_sleep_data(today)
             daily_sleep = sleep_data.get('dailySleepDTO', {})
@@ -294,7 +299,8 @@ def get_morning_report(chat_id=None):
                 start_dt = datetime.fromtimestamp(start_ts / 1000)
                 end_dt = datetime.fromtimestamp(end_ts / 1000)
                 sleep_range = f"({start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')})"
-        except: pass
+        except Exception:
+            pass
         
         # 2. BODY BATTERY
         bb_charged, bb_now = "-", "-"
@@ -304,10 +310,11 @@ def get_morning_report(chat_id=None):
                 values = bb_data[0].get('bodyBatteryValuesArray', [])
                 if values:
                     vals = [x[1] for x in values if x[1] is not None]
-                    if vals: 
-                        bb_charged = max(vals) 
-                        bb_now = vals[-1]      
-        except: pass
+                    if vals:
+                        bb_charged = max(vals)
+                        bb_now = vals[-1]
+        except Exception:
+            pass
 
         # 3. RHR
         rhr = "-"
@@ -316,7 +323,8 @@ def get_morning_report(chat_id=None):
             user_sum_data = garmin.get_user_summary(today)
             if user_sum_data and 'restingHeartRate' in user_sum_data:
                 rhr = user_sum_data['restingHeartRate']
-        except: pass
+        except Exception:
+            pass
 
         # 4. TRAINING READINESS
         readiness = "-"
@@ -326,10 +334,12 @@ def get_morning_report(chat_id=None):
                 if isinstance(r_data, list) and len(r_data) > 0:
                     readiness = r_data[0].get('score', '-')
                 elif isinstance(r_data, dict):
-                    if 'score' in r_data: readiness = r_data['score']
+                    if 'score' in r_data:
+                        readiness = r_data['score']
                     elif 'trainingReadinessDynamicDTO' in r_data:
                         readiness = r_data['trainingReadinessDynamicDTO'].get('score')
-        except: pass
+        except Exception:
+            pass
 
         if readiness == "-" and user_sum_data:
             try:
@@ -337,15 +347,149 @@ def get_morning_report(chat_id=None):
                     readiness = user_sum_data['trainingReadinessDynamicDTO'].get('score')
                 elif 'trainingReadiness' in user_sum_data:
                     readiness = user_sum_data['trainingReadiness']
-            except: pass
+            except Exception:
+                pass
             
         if readiness is None: readiness = "-"
 
         # 5. HRV (LAST NIGHT + AVERAGE)
         hrv_status, hrv_avg, hrv_last = "-", "-", "-"
         try:
-            hrv_data = garmin.get_hrv_data(today) 
+            hrv_data = garmin.get_hrv_data(today)
             if hrv_data and 'hrvSummary' in hrv_data:
                 summary = hrv_data['hrvSummary']
                 hrv_status = summary.get('status', '-').title()
-                hrv_avg = summary.get
+                hrv_avg = summary.get('weeklyAvg', '-')
+                hrv_last = summary.get('lastNightAvg', '-')
+        except Exception:
+            pass
+
+        # READINESS ADVICE
+        advice = T['advice_ok']
+        if isinstance(readiness, (int, float)):
+            if readiness >= 80: advice = T['advice_go']
+            elif readiness >= 50: advice = T['advice_ok']
+            elif readiness >= 25: advice = T['advice_warn']
+            else: advice = T['advice_stop']
+
+        report = (
+            f"{T['morning_title']} ({today})\n\n"
+            f"{T['sleep']}\n"
+            f"• Puntuación: *{sleep_score}* ({sleep_qual})\n"
+            f"• {T['duration']}: *{format_duration_hm(sleep_secs)}* {sleep_range}\n\n"
+            f"{T['body_batt']}\n"
+            f"• {T['bb_max']}: *{bb_charged}* | {T['bb_now']}: *{bb_now}*\n\n"
+            f"{T['heart']}\n"
+            f"• {T['rhr']}: *{rhr} bpm*\n"
+            f"• {T['hrv']}: *{hrv_last} ms* (Estado: {hrv_status} | Promed: {hrv_avg}ms)\n\n"
+            f"{T['readiness']}\n"
+            f"• Puntuación: *{readiness}/100*\n"
+            f"👉 _{advice}_"
+        )
+        return report
+
+    except Exception as e:
+        if "MFA_REQUIRED" in str(e):
+            return None
+        logging.error(f"Error in morning report: {e}\n{traceback.format_exc()}")
+        return T['err_morning']
+
+# ==============================================================================
+# MENU & RECENT ACTIVITIES LOGIC
+# ==============================================================================
+
+def get_activities_menu(chat_id=None):
+    try:
+        garmin = get_garmin_client(chat_id=chat_id)
+        activities = garmin.get_activities(0, 5)
+        if not activities:
+            return T['err_not_found']
+
+        lines = [T['menu_title'], ""]
+        for idx, act in enumerate(activities):
+            name = act.get('activityName', 'Actividad')
+            dist = safe_round(act.get('distance', 0) / 1000, 2)
+            date_str = act.get('startTimeLocal', '')[:10]
+            lines.append(f"*{idx}* - {date_str} | *{name}* ({dist} km)")
+
+        lines.append("")
+        lines.append(T['menu_footer'])
+        return "\n".join(lines)
+    except Exception as e:
+        if "MFA_REQUIRED" in str(e):
+            return None
+        logging.error(f"Error in activities menu: {e}")
+        return T['err_menu']
+
+# ==============================================================================
+# MAIN TELEGRAM WEBHOOK ENTRYPOINT
+# ==============================================================================
+
+def telegram_webhook(request):
+    """Entry point for Google Cloud Run / Functions Framework."""
+    try:
+        data = request.get_json(silent=True) or {}
+        message = data.get("message", {})
+        text = message.get("text", "").strip()
+        chat_id = message.get("chat", {}).get("id")
+
+        if not chat_id or not text:
+            return "OK", 200
+
+        # ----------------------------------------------------------------------
+        # COMMAND 1: /mfa 123456
+        # ----------------------------------------------------------------------
+        if text.lower().startswith("/mfa"):
+            parts = text.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                mfa_code = parts[1]
+                send_telegram(chat_id, "⏳ Verificando código MFA con Garmin...")
+                try:
+                    get_garmin_client(chat_id=chat_id, mfa_code=mfa_code)
+                    send_telegram(chat_id, T['mfa_success'])
+                except Exception as e:
+                    send_telegram(chat_id, f"❌ Error verificando MFA: {str(e)}")
+            else:
+                send_telegram(chat_id, T['mfa_invalid_format'])
+            return "OK", 200
+
+        # ----------------------------------------------------------------------
+        # COMMAND 2: MORNING REPORT ('morning' / 'mañana')
+        # ----------------------------------------------------------------------
+        if text.lower() in ['morning', 'mañana', 'manana']:
+            send_telegram(chat_id, T['loading_vital'])
+            report = get_morning_report(chat_id=chat_id)
+            if report:
+                send_telegram(chat_id, report)
+            return "OK", 200
+
+        # ----------------------------------------------------------------------
+        # COMMAND 3: ACTIVITIES LIST ('list' / 'lista')
+        # ----------------------------------------------------------------------
+        if text.lower() in ['list', 'lista']:
+            send_telegram(chat_id, T['loading_hist'])
+            menu = get_activities_menu(chat_id=chat_id)
+            if menu:
+                send_telegram(chat_id, menu)
+            return "OK", 200
+
+        # ----------------------------------------------------------------------
+        # DEFAULT / HELP COMMAND
+        # ----------------------------------------------------------------------
+        if text == "/start" or text.lower() == "help":
+            send_telegram(chat_id, T['help_msg'])
+            return "OK", 200
+
+        # Handle numeric input (0, 1, 2...) for activity selection
+        if text.isdigit():
+            send_telegram(chat_id, T['loading_1'])
+            # Here you can hook in your full individual activity report function
+            send_telegram(chat_id, f"Fetching details for activity index {text}...")
+            return "OK", 200
+
+        send_telegram(chat_id, T['help_msg'])
+        return "OK", 200
+
+    except Exception as e:
+        logging.error(f"Error in webhook handler: {e}\n{traceback.format_exc()}")
+        return "OK", 200
